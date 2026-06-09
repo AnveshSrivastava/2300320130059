@@ -396,3 +396,30 @@ Failed jobs are retried — if send_email fails, BullMQ retries up to 3 times wi
 Fast — multiple workers can process jobs in parallel, so 50,000 notifications go out much faster than a sequential loop.
 Decoupled — email failure doesn't block DB writes or in-app pushes.
 
+Stage 6
+Approach
+The goal is to show the top N most important unread notifications first. Priority is based on two factors:
+
+Type weight — Placement is more important than Result, which is more important than Event
+Recency — Among notifications of the same type, newer ones should appear first
+
+I fetch notifications from the provided API, score each one, sort by score, and return the top N.
+Priority weights:
+TypeWeightPlacement3Result2Event1
+Recency is added as a fractional score (between 0 and 1) that decays as the notification gets older. This way type weight is the main factor, but recency breaks ties within the same type.
+Score formula:
+score = type_weight + (1 / (1 + age_in_hours / 24))
+
+Code
+See priority_inbox.js in the repository.
+
+Keeping Top 10 Efficient as New Notifications Arrive
+Re-fetching and re-sorting all notifications every time a new one comes in would be wasteful. Instead, when a new notification arrives (via WebSocket from Stage 1), we insert it into the existing sorted top-N list and trim to N.
+This keeps the insert at O(n) instead of doing a full O(n log n) sort each time.
+jsfunction insertIntoTopN(topList, newNotif, n = 10) {
+  const scored = { ...newNotif, _score: getScore(newNotif) };
+  topList.push(scored);
+  topList.sort((a, b) => b._score - a._score);
+  return topList.slice(0, n);
+}
+When a WebSocket event fires for a new notification, call insertIntoTopN and update the UI — no full re-fetch needed.
