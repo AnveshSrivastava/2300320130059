@@ -263,4 +263,70 @@ WHERE n.notification_type = 'Placement'
   AND n.created_at >= NOW() - INTERVAL '7 days'
 ORDER BY n.created_at DESC;
 ```
+---
 
+# Stage 4
+
+## Problem
+
+Notifications are being fetched from the DB on every page load for every student. With 50,000 students, this means thousands of DB queries happening constantly, which is why the DB is getting overwhelmed.
+
+---
+
+## Solutions
+
+### 1. Caching with Redis
+
+The most direct fix is to cache notification results in Redis. When a student's notifications are fetched, store the result in Redis with a short TTL (e.g., 60 seconds). On the next page load, serve from cache instead of hitting the DB.
+
+```js
+const cacheKey = `notifications:${studentId}`;
+
+// Check cache first
+const cached = await redis.get(cacheKey);
+if (cached) return JSON.parse(cached);
+
+// Otherwise query DB
+const result = await db.query(
+  'SELECT id, type, message, is_read, created_at FROM notifications WHERE student_id = $1 ORDER BY created_at DESC',
+  [studentId]
+);
+
+// Store in cache for 60 seconds
+await redis.set(cacheKey, JSON.stringify(result.rows), 'EX', 60);
+return result.rows;
+```
+
+**Tradeoff:** The data might be slightly stale (up to 60 seconds). If a new notification arrives, the student won't see it immediately until the cache expires. You can reduce this by invalidating the cache whenever a new notification is created for that user.
+
+---
+
+### 2. Only Fetch Unread Count on Page Load
+
+Instead of loading all notifications on every page load, just fetch the unread count. Load the full list only when the student clicks the notification bell.
+
+This reduces both the size and frequency of DB queries significantly.
+
+````
+// On page load — lightweight
+GET /api/notifications/unread-count
+
+// Only when bell is clicked — heavier query
+GET /api/notifications
+Tradeoff: Slightly more complex frontend logic (lazy loading), but a big improvement in DB load since most users don't click the bell on every visit.
+
+3. Pagination
+Instead of returning all notifications at once, return them in pages (e.g., 20 at a time). This keeps each query small regardless of how many notifications a student has.
+sqlSELECT id, type, message, is_read, created_at
+FROM notifications
+WHERE student_id = 1042
+ORDER BY created_at DESC
+LIMIT 20 OFFSET 0;  -- page 1
+Tradeoff: Frontend needs to implement "load more" or infinite scroll. But the DB never has to return hundreds of rows in a single query.
+
+4. DB Read Replicas
+If the app is read-heavy (which it is — most users just view notifications, not create them), you can set up read replicas of the DB. All SELECT queries go to replicas, while writes (INSERT, UPDATE, DELETE) go to the primary.
+Tradeoff: Adds infrastructure complexity and cost. There's also a small replication lag, so very recent writes might not be visible on the replica immediately. For notifications this is generally acceptable.
+
+What I'd actually do
+Start with caching (Redis) + fetch unread count on load + pagination. These three together reduce DB load significantly without adding much complexity. Read replicas would be considered only if the app continues to scale beyond what caching can handle.
