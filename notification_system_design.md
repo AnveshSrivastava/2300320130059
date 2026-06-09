@@ -159,23 +159,108 @@ sqlSELECT id, type, message, is_read, created_at
 FROM notifications
 WHERE user_id = 55
 ORDER BY created_at DESC;
+
 Get only unread notifications:
 sqlSELECT id, type, message, created_at
 FROM notifications
 WHERE user_id = 55 AND is_read = FALSE
 ORDER BY created_at DESC;
+
 Get unread count:
 sqlSELECT COUNT(*) AS unread_count
 FROM notifications
 WHERE user_id = 55 AND is_read = FALSE;
+
 Mark a single notification as read:
 sqlUPDATE notifications
 SET is_read = TRUE
 WHERE id = 101 AND user_id = 55;
+
 Mark all notifications as read for a user:
 sqlUPDATE notifications
 SET is_read = TRUE
 WHERE user_id = 55 AND is_read = FALSE;
+
 Delete a notification:
 sqlDELETE FROM notifications
 WHERE id = 101 AND user_id = 55;
+
+# Stage 3
+
+## Is the query accurate?
+
+```sql
+SELECT * FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt ASC;
+```
+
+The query is logically correct — it does fetch unread notifications for a specific student. But it has a few issues worth fixing:
+
+- `SELECT *` fetches all columns including ones the frontend probably doesn't need. Better to select only the required fields.
+- Column naming style (`studentID`, `isRead`, `createdAt`) uses camelCase, which is non-standard in SQL. PostgreSQL lowercases identifiers by default, so these would either fail or require quoting. Better to use snake_case (`student_id`, `is_read`, `created_at`).
+- `ORDER BY createdAt ASC` returns oldest first — for a notification feed, descending order (newest first) makes more sense.
+
+---
+
+## Why is it slow?
+
+With 5,000,000 rows, this query is slow because without an index on `student_id` and `is_read`, the DB has to do a **full table scan** — it reads every row to find the matching ones. That's expensive at this scale.
+
+**Estimated cost:** At 5M rows, a full table scan means the DB engine checks all 5M rows, even though only a handful belong to student 1042. This is O(n) and gets worse as data grows.
+
+**Fix — add a composite index:**
+
+```sql
+CREATE INDEX idx_notifications_student_unread
+ON notifications(student_id, is_read);
+```
+
+With this index, the DB can jump directly to rows for `student_id = 1042` where `is_read = false`, reducing the scan to a small fraction of the table. Query cost drops significantly.
+
+**Improved query:**
+
+```sql
+SELECT id, type, message, created_at
+FROM notifications
+WHERE student_id = 1042 AND is_read = false
+ORDER BY created_at DESC;
+```
+
+---
+
+## Should you add indexes on every column?
+
+No, that's not good advice.
+
+Indexes speed up reads but they slow down writes (INSERT, UPDATE, DELETE) because the DB has to update the index every time data changes. If you index every column:
+
+- Every new notification insert becomes slower
+- Every `is_read` update (which happens frequently) becomes slower
+- Storage usage increases
+
+You should only index columns that are actually used in `WHERE` or `ORDER BY` clauses in frequent queries. In this case, a composite index on `(student_id, is_read)` is enough. Blindly indexing everything trades one problem for another.
+
+---
+
+## Query: Students who got a Placement notification in the last 7 days
+
+```sql
+SELECT DISTINCT student_id
+FROM notifications
+WHERE notification_type = 'Placement'
+  AND created_at >= NOW() - INTERVAL '7 days';
+```
+
+This returns all unique student IDs who received at least one notification with `notification_type = 'Placement'` in the past 7 days.
+
+If you want the full notification details along with student info:
+
+```sql
+SELECT n.id, n.student_id, n.message, n.created_at
+FROM notifications n
+WHERE n.notification_type = 'Placement'
+  AND n.created_at >= NOW() - INTERVAL '7 days'
+ORDER BY n.created_at DESC;
+```
+
