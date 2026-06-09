@@ -423,3 +423,4 @@ jsfunction insertIntoTopN(topList, newNotif, n = 10) {
   return topList.slice(0, n);
 }
 When a WebSocket event fires for a new notification, call insertIntoTopN and update the UI — no full re-fetch needed.
+
