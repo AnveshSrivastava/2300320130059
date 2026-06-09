@@ -330,3 +330,69 @@ Tradeoff: Adds infrastructure complexity and cost. There's also a small replicat
 
 What I'd actually do
 Start with caching (Redis) + fetch unread count on load + pagination. These three together reduce DB load significantly without adding much complexity. Read replicas would be considered only if the app continues to scale beyond what caching can handle.
+
+
+Stage 5
+Original Pseudocode
+function notify_all(student_ids: array, message: string):
+    for student_id in student_ids:
+        send_email(student_id, message) 
+        save_to_db(student_id, message) 
+        push_to_app(student_id, message)
+
+Shortcomings
+1. No error handling — one failure stops everything
+If send_email fails for student 500 out of 50,000, the loop crashes and the remaining 49,500 students don't get notified at all. There's no retry, no logging of which students failed, nothing.
+This is exactly what happened — the email API failed at student 200, and the rest were never processed.
+
+2. It's synchronous and slow
+The loop processes one student at a time: send email → save to DB → push to app → next student. For 50,000 students, this is extremely slow. If each iteration takes even 100ms, that's 5,000 seconds (~83 minutes) to complete.
+
+3. Email and DB are tightly coupled
+If the email API is down, nothing gets saved to DB either, even though those are independent operations. DB saves and email sends should not depend on each other.
+
+Should DB save and email send happen together?
+No. They are two separate concerns:
+
+Saving to DB is a record of the notification — it should always happen, regardless of whether the email was sent.
+Sending the email is a delivery mechanism that can fail, be retried, or be skipped.
+
+If you tie them together, a failed email means no DB record either, so the student has no in-app notification and there's no way to retry just the email later.
+
+Redesigned Approach — Job Queue with BullMQ
+Instead of processing everything synchronously in a loop, push each student's notification into a job queue. Workers pick up jobs and process them independently. Failed jobs are retried automatically.
+Revised Pseudocode:
+
+async function notify_all(student_ids, message) {
+  for (const student_id of student_ids) {
+    await notificationQueue.add('notify', { student_id, message });
+  }
+}
+
+
+notificationQueue.process('notify', async (job) => {
+  const { student_id, message } = job.data;
+
+
+  await save_to_db(student_id, message);
+  
+  await push_to_app(student_id, message);
+
+  await send_email(student_id, message);
+});
+
+
+const notificationQueue = new Queue('notifications', {
+  defaultJobOptions: {
+    attempts: 3,
+    backoff: { type: 'exponential', delay: 2000 }
+  }
+});
+
+Why this is better
+
+DB save always happens first — the in-app notification is stored regardless of email success.
+Failed jobs are retried — if send_email fails, BullMQ retries up to 3 times with backoff. Failed jobs are logged so you can see exactly which students weren't emailed.
+Fast — multiple workers can process jobs in parallel, so 50,000 notifications go out much faster than a sequential loop.
+Decoupled — email failure doesn't block DB writes or in-app pushes.
+
